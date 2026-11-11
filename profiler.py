@@ -2,119 +2,80 @@
 Autonomous EDA Engine (Deep Path).
 Question-Directed Hierarchical Investigation via LangGraph:
 Decomposes complex or investigative questions into targeted sub-hypotheses,
-executes code & visual evidence for each, and synthesizes a direct-answer report.
+executes code & visual evidence for each across stateful nodes in LangGraph,
+and synthesizes a direct-answer executive briefing.
 """
-import json
-import operator
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import io
 import os
 import re
-import subprocess
-import sys
-import tempfile
+import threading
 import warnings
-from typing import Annotated, Literal, Optional, TypedDict
+from typing import Optional, TypedDict
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from dotenv import load_dotenv
 from langchain_openrouter import ChatOpenRouter
-from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
+from langgraph.graph import START, END, StateGraph
 
 load_dotenv(override=True)
 if os.getenv("OPENROUTER") and not os.getenv("OPENROUTER_API_KEY"):
     os.environ["OPENROUTER_API_KEY"] = os.getenv("OPENROUTER")
 warnings.filterwarnings("ignore", message=".*fixed sampling defaults.*")
 
-# ---------- Model & Config ----------
-MODEL = os.getenv("REASONING_MODEL", os.getenv("EDA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"))
-if MODEL.startswith("openrouter:"):
-    MODEL = MODEL[len("openrouter:"):]
+# ---------- Models & Config ----------
+FAST_MODEL = os.getenv("FAST_MODEL", "nvidia/nemotron-3.5-lightning:free")
+if FAST_MODEL.startswith("openrouter:"):
+    FAST_MODEL = FAST_MODEL[len("openrouter:"):]
 
-MAX_RETRIES = 2
-MAX_REVISIONS = 1
-MIN_GROUP_SIZE = 20
-EXEC_TIMEOUT = 60
+REASONING_MODEL = os.getenv("REASONING_MODEL", os.getenv("EDA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"))
+if REASONING_MODEL.startswith("openrouter:"):
+    REASONING_MODEL = REASONING_MODEL[len("openrouter:"):]
+
 OUT_DIR = "outputs"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-llm = ChatOpenRouter(
-    model=MODEL,
-    api_key=os.getenv("OPENROUTER") or os.getenv("OPENROUTER_API_KEY"),
+# Lock for thread-safe Matplotlib rendering
+matplotlib_lock = threading.Lock()
+
+api_key = os.getenv("OPENROUTER") or os.getenv("OPENROUTER_API_KEY")
+
+fast_llm = ChatOpenRouter(
+    model=FAST_MODEL,
+    api_key=api_key,
     temperature=0.1,
-    max_retries=3,
+    max_retries=1,
+    request_timeout=35000,
 )
 
-# ---------- Pydantic Models for Structured Output ----------
-class SubQuestionPlan(BaseModel):
-    agenda: list[str] = Field(
-        description="An ordered list of 3 to 4 specific, empirical sub-questions to investigate the user's goal. "
-                    "Include: (1) baseline disparity for the queried factor, (2) controlling for primary confounders, "
-                    "(3) subgroup interactions/vulnerability, and (4) multivariate attribution or threshold cliffs."
-    )
-    target_variable: str = Field(
-        description="The primary outcome/target column being analyzed."
-    )
-    rationale: str = Field(
-        description="A concise summary of how these sub-questions directly address the user's inquiry."
-    )
+reasoning_llm = ChatOpenRouter(
+    model=REASONING_MODEL,
+    api_key=api_key,
+    temperature=0.1,
+    max_retries=1,
+    request_timeout=45000,
+)
 
-
-class Finding(BaseModel):
-    statement: str = Field(description="One sentence: key rates + group sizes written as 'n = 123' + takeaway.")
-    strength: int = Field(default=3, description="1 (weak) to 5 (robust, large sample, strong effect).")
-    adjusted_for: list[str] = Field(default_factory=list, description="Dataset columns held constant in this finding.")
-    variable: str = Field(default="", description="The primary column this finding focuses on.")
-
-
-class CriticReview(BaseModel):
-    verdict: Literal["accept", "revise", "reject"] = Field(
-        description="Choose 'accept' if output clearly answers the sub-question with rates and group sizes (n >= 20). "
-                    "Choose 'revise' if a minor code fix will yield adequate sample sizes or missing rates. "
-                    "Choose 'reject' only if data cannot support the question."
-    )
-    reason: str = Field(description="Brief justification for the verdict.")
-    findings: list[Finding] = Field(default_factory=list, description="Extracted findings with rates and group sizes.")
-
-
-decomposer_llm = llm.with_structured_output(SubQuestionPlan)
-critic_llm = llm.with_structured_output(CriticReview)
-
-
-# ---------- State Definition ----------
-class EDAState(TypedDict):
-    data_path: str
-    goal: str
-    summary: str
-    columns: list[str]
-    numeric_columns: list[str]
-    id_like_columns: list[str]
-    outcome: str
-    agenda: list[str]
-    current_idx: int
-    question: str
-    code: str
-    output: str
-    error: Optional[str]
-    retries: int
-    revisions: int
-    verdict: str
-    critique: str
-    pending_findings: list[dict]
-    findings: Annotated[list[dict], operator.add]
-    step_charts: Annotated[list[str], operator.add]
-    failed: Annotated[list[str], operator.add]
-    rejected: Annotated[list[str], operator.add]
+# Safe built-in functions allowed inside in-memory exec()
+SAFE_BUILTINS = {
+    "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
+    "enumerate": enumerate, "filter": filter, "float": float, "int": int,
+    "isinstance": isinstance, "issubclass": issubclass, "iter": iter,
+    "len": len, "list": list, "map": map, "max": max, "min": min,
+    "next": next, "print": print, "range": range, "reversed": reversed,
+    "round": round, "set": set, "slice": slice, "sorted": sorted,
+    "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+    "True": True, "False": False, "None": None,
+}
 
 
 # ---------- Helpers & Text Sanitization ----------
-def ask(system: str, user: str) -> str:
-    content = llm.invoke([("system", system), ("user", user)]).content
-    if isinstance(content, list):
-        content = "".join(b if isinstance(b, str) else b.get("text", "") for b in content)
-    return content
-
-
 def strip_fences(text: str) -> str:
     m = re.search(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
     return (m.group(1) if m else text).strip()
@@ -133,426 +94,472 @@ def sanitize_text(text: str) -> str:
     return fix_numbers(fix_pct(text.strip()))
 
 
-# ---------- Node 1: Profiler & Agenda Decomposer ----------
-DECOMPOSER_SYSTEM = """You are a Principal Data Scientist planning an exploratory data analysis.
-Your job is to decompose the user's analytical goal into 3 to 4 targeted, empirical sub-questions.
-The sub-questions must DIRECTLY investigate the user's specific hypothesis or query.
+# ---------- Prompts (Dynamic & User-Directed) ----------
+DECOMPOSER_SYSTEM = """Decompose the user's analytical question into 3–4 sequential, empirical sub-questions.
 
-Guidelines:
-1. Sub-question 1 (Direct Disparity / Baseline):
-   - Measure the exact rates or statistics for the primary factor(s) named in the user query.
-2. Sub-question 2 (Confounder Control):
-   - Test whether the observed relationship holds after controlling for the dataset's strongest demographic or structural covariates (e.g. sex, age, class, tier).
-3. Sub-question 3 (Subgroup Vulnerability / Interactions):
-   - Examine how the effect differs across specific sub-populations (e.g. vulnerable groups, high-risk segments).
-4. Sub-question 4 (Multivariate Attribution / Mechanism / Thresholds):
-   - Check combined factors, continuous non-linear thresholds, or relative risk contributions.
+RULES:
+- Each sub-question must directly advance answering the user's specific inquiry.
+- Reference actual column names from the dataset summary.
+- Each must be answerable with one pandas calculation + one matplotlib/seaborn chart.
+- Always require group sample sizes (n = …) alongside rates or averages.
+- Tailor the decomposition to the user's intent:
+  • Specific hypothesis → progressive breakdown: base rates, covariate interactions, thresholds, edge cases.
+  • Exploratory question → top predictors, interaction effects, notable subgroups.
+  • Distribution/anomaly question → shape, extreme-value profiling, underlying drivers.
+"""
 
-Every sub-question MUST be answerable via a concise pandas/seaborn script on the loaded DataFrame.
+CODER_SYSTEM = """Write concise Python code to answer the given sub-question.
+
+ENVIRONMENT (already available):
+- `df`: pandas DataFrame | `pd`, `np`, `plt`, `sns`: imported | `CHART_PATH`: save path for the chart.
+- Save exactly ONE chart: `plt.savefig(CHART_PATH, bbox_inches='tight')`. No `plt.show()`.
+
+REQUIREMENTS:
+- Always `print()` group sample sizes (n = …) alongside any rates, averages, or percentages.
+- Use ONLY existing columns from the dataset summary. Map domain values to their column (e.g. Cherbourg/Southampton -> 'Embarked' values 'C'/'S').
+- Print human-readable summary tables or key numbers.
+- Return ONLY executable Python code.
+"""
+
+REPORTER_SYSTEM = """Write a Markdown executive briefing that directly answers the user's question using the empirical evidence provided.
+
+STRUCTURE:
+1. **Lead with the answer.** First 1–2 sentences: definitive answer + primary numbers and sample sizes (n = …).
+2. **Evidence sections.** Use descriptive `###` headings tailored to the findings (not generic labels). Quote exact numbers, percentages, and sample sizes. Cite step charts where relevant (e.g. `[Step 1 Chart]`).
+3. **Nuances.** Note surprising subgroups, confounders, or edge cases that qualify the answer.
+4. **Next steps.** 2–3 concrete, actionable recommendations stemming from this analysis.
+
+Keep headings at `###` level. No filler, no boilerplate.
 """
 
 
-def profiler(state: EDAState) -> dict:
-    """Reads dataset, constructs summary, and generates the question-directed investigation agenda."""
-    df = pd.read_csv(state["data_path"])
-    target = state["outcome"]
+def _find_best_column(columns: list[str], text: str, target: str) -> str:
+    """Intelligently matches an analytical question to the most relevant DataFrame column using domain synonyms and fuzzy stemming."""
+    text_lower = text.lower()
+    candidates = [c for c in columns if c.lower() != target.lower()]
+    if not candidates:
+        return columns[0] if columns else target
 
-    # Detect target if not explicitly valid
-    if target not in df.columns:
-        candidates = ["survived", "churn", "target", "label", "outcome", "y", "fraud"]
-        found = next((c for c in df.columns if c.lower() in candidates), None)
-        target = found if found else str(df.columns[-1])
+    # 1. Exact column name match (case-insensitive)
+    for c in candidates:
+        if c.lower() in text_lower:
+            return c
 
-    lines = [f"Shape: {df.shape[0]} rows x {df.shape[1]} columns", f"Target Column: {target}", "Columns:"]
-    for c in df.columns:
-        lines.append(f"- {c}: dtype={df[c].dtype}, missing={df[c].isna().mean():.1%}, unique={df[c].nunique()}")
+    # 2. Known domain synonym mappings
+    SYNONYM_MAP = {
+        ("embark", "port", "cherbourg", "southampton", "queenstown", "dock", "board"): ["Embarked", "embarked", "Port", "port"],
+        ("class", "pclass", "ticket class", "cabin class", "tier", "luxury"): ["Pclass", "pclass", "Class", "class"],
+        ("sex", "gender", "male", "female", "man", "men", "woman", "women", "mother", "father", "boy", "girl"): ["Sex", "sex", "Gender", "gender"],
+        ("age", "young", "old", "child", "children", "elderly", "adult", "infant", "baby", "kid"): ["Age", "age"],
+        ("fare", "price", "ticket price", "paid", "cost", "expensive", "cheap"): ["Fare", "fare"],
+        ("family", "relative", "relatives", "sibsp", "parch", "parent", "parents", "sibling", "siblings", "solo", "alone"): ["SibSp", "Parch", "FamilySize", "family_size"],
+    }
+    for keywords, target_cols in SYNONYM_MAP.items():
+        if any(k in text_lower for k in keywords):
+            for tc in target_cols:
+                for c in candidates:
+                    if c.lower() == tc.lower():
+                        return c
 
-    numeric = df.select_dtypes("number")
-    n = len(df)
-    id_like = [
-        str(c) for c in df.columns
-        if n and ((pd.api.types.is_integer_dtype(df[c]) and df[c].nunique() / n >= 0.9)
-                  or (not pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() / n >= 0.5))
-    ]
+    # 3. Stem / prefix match (first 4+ characters of column name)
+    for c in candidates:
+        stem = c.lower()[:max(4, len(c) - 1)]
+        if len(stem) >= 3 and stem in text_lower:
+            return c
 
-    summary_str = "\n".join(lines)
+    return candidates[0]
 
-    # Decompose the user's specific query into a 3-4 step agenda
+
+def decompose_agenda(goal: str, target: str, summary_str: str, max_steps: int = 4) -> tuple[list[str], Optional[str]]:
+    """Generates a targeted 3-4 step investigation agenda dynamically tailored to the user's inquiry."""
+    cols = [line.split(":")[0].replace("-", "").strip() for line in summary_str.splitlines() if ":" in line and "-" in line]
+    best_col = _find_best_column(cols, goal, target)
+
+    fallback_agenda = [
+        f"What is the baseline {target} distribution across categories of {best_col}? Show rates and group sizes (n = ...).",
+        f"How do other key confounding variables interact with {best_col} in affecting {target}?",
+        f"Are there specific high-risk or high-survival subgroups within {best_col}?",
+        f"What are the combined effects and key patterns involving {best_col} and {target}?",
+    ][:max_steps]
+
     user_prompt = (
-        f"User Inquiry / Goal: {state['goal']}\n"
+        f"User Inquiry / Goal: {goal}\n"
         f"Target Column: {target}\n\n"
-        f"Dataset Summary:\n{summary_str}\n\n"
-        "Generate 3 to 4 specific, complementary sub-questions that systematically answer the user's inquiry."
+        f"Dataset Summary:\n{summary_str[:800]}\n\n"
+        f"Generate {max_steps} specific, complementary sub-questions that systematically answer the user's inquiry.\n"
+        "Output ONLY numbered lines (1., 2., 3., 4.). No markdown fences or conversational filler."
     )
-
-    agenda = []
-    try:
-        plan = decomposer_llm.invoke([
+    def _call_decomposer(m):
+        return m.invoke([
             ("system", DECOMPOSER_SYSTEM),
             ("user", user_prompt)
-        ])
-        agenda = [q.strip() for q in plan.agenda if q.strip()][:4]
-    except Exception as e:
-        print(f"[decomposer] structured output failed: {e}")
-        # Robust fallback agenda directly mentioning the user's goal
-        agenda = [
-            f"Examine the baseline relationship between {state['goal']} and {target}, showing rates and group sizes.",
-            f"Test whether the relationship holds after controlling for primary confounding variables.",
-            f"Analyze subgroup interactions and identify which specific segments are most affected.",
-            f"Assess combined factors and quantify independent contributions to {target}."
-        ]
+        ]).content
 
-    if not agenda:
-        agenda = [
-            f"Analyze key factors related to {state['goal']} against {target}.",
-            f"Control for main covariates and evaluate subgroup differences."
-        ]
+    last_error = None
+    for model in [fast_llm, reasoning_llm]:
+        ex = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = ex.submit(_call_decomposer, model)
+            res = fut.result(timeout=35.0)
+            if isinstance(res, list):
+                res = "".join(b if isinstance(b, str) else b.get("text", "") for b in res)
 
+            agenda = [
+                re.sub(r"^\d+[\.\)]\s*", "", line).strip()
+                for line in res.splitlines()
+                if re.match(r"^\d+[\.\)]", line.strip()) and len(line.strip()) > 8
+            ][:max_steps]
+            if len(agenda) >= 2:
+                return agenda, None
+        except Exception as e:
+            last_error = str(e)
+            continue
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    return fallback_agenda, last_error
+
+
+def execute_step_in_memory(code: str, df: pd.DataFrame, chart_path: str) -> tuple[str, Optional[str]]:
+    """Executes step code in RAM under a thread lock to ensure safe Matplotlib rendering."""
+    with matplotlib_lock:
+        plt.close("all")
+        stdout_capture = io.StringIO()
+        local_env = {
+            "__builtins__": SAFE_BUILTINS,
+            "df": df.copy(),
+            "pd": pd,
+            "np": np,
+            "plt": plt,
+            "sns": sns,
+            "CHART_PATH": chart_path,
+        }
+        err = None
+        try:
+            with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stdout_capture):
+                exec(code, local_env)
+        except Exception as e:
+            err = str(e)
+        finally:
+            plt.close("all")
+
+        output = stdout_capture.getvalue().strip()
+        return output, err
+
+
+# ---------- LangGraph State & Node Definitions ----------
+class EDAState(TypedDict):
+    goal: str
+    target: str
+    summary: str
+    df: pd.DataFrame
+    max_steps: int
+    agenda: list[str]
+    current_idx: int
+    question: str
+    code: str
+    output: str
+    error: Optional[str]
+    retries: int
+    step_charts: list[str]
+    findings: list[dict]
+    report: str
+
+
+def profiler_node(state: EDAState) -> dict:
+    """LangGraph Node 1: Decomposes the user's question into an empirical agenda."""
+    steps = state.get("max_steps", 4)
+    agenda, _ = decompose_agenda(state["goal"], state["target"], state["summary"], max_steps=steps)
     return {
-        "summary": summary_str,
-        "columns": [str(c) for c in df.columns],
-        "numeric_columns": [str(c) for c in numeric.columns],
-        "id_like_columns": id_like,
-        "outcome": target,
         "agenda": agenda,
         "current_idx": 0,
-        "findings": [],
         "step_charts": [],
-        "failed": [],
-        "rejected": [],
+        "findings": [],
     }
 
 
-# ---------- Node 2: Planner (Schedules Current Sub-Question) ----------
-def planner(state: EDAState) -> dict:
-    idx = state.get("current_idx", 0)
-    agenda = state.get("agenda", [])
-    if idx < len(agenda):
-        current_q = agenda[idx]
-    else:
-        current_q = f"Synthesizing findings for {state['goal']}"
-
+def planner_node(state: EDAState) -> dict:
+    """LangGraph Node 2: Selects the next empirical sub-question to investigate."""
+    idx = state["current_idx"]
+    q = state["agenda"][idx]
     return {
-        "question": current_q,
-        "code": "",
-        "output": "",
-        "error": None,
+        "current_idx": idx,
+        "question": q,
         "retries": 0,
-        "revisions": 0,
-        "verdict": "",
-        "critique": "",
-        "pending_findings": []
+        "error": None,
     }
 
 
-# ---------- Node 3: Coder ----------
-CODER_SYSTEM = f"""You are an expert Python data analyst.
-Given an empirical sub-question and dataset summary, write concise, robust Python code to answer it.
-Environment:
-- `df` is already loaded as a pandas DataFrame.
-- `pd`, `np`, `plt`, and `sns` are already imported.
-- `CHART_PATH` is a predefined string variable. Save exactly ONE visualization to `CHART_PATH` using `plt.savefig(CHART_PATH, bbox_inches='tight')`.
-- Do NOT call `plt.show()`.
-- Group sizes (n) are MANDATORY: Always compute and `print()` group sizes (n) alongside every percentage, mean, or comparison.
-- Make compared groups coarse enough so that compared groups have n >= {MIN_GROUP_SIZE} where possible.
-- Print clear, human-readable summary tables or rates with `print()`.
-- Return ONLY executable Python code in a single code block.
-"""
+def _call_coder_llm(prompt: str) -> str:
+    res = fast_llm.invoke([
+        ("system", CODER_SYSTEM),
+        ("user", prompt)
+    ]).content
+    if isinstance(res, list):
+        return "".join(b if isinstance(b, str) else b.get("text", "") for b in res)
+    return str(res)
 
 
-def coder(state: EDAState) -> dict:
-    prompt = (
-        f"Sub-Question to investigate: {state['question']}\n\n"
-        f"Primary Target: {state['outcome']}\n"
-        f"Dataset Summary:\n{state['summary'][:1000]}\n\n"
-        f"Write Python code to analyze the data, print the numerical results (with group sizes n), and save a relevant chart to CHART_PATH."
-    )
+def coder_node(state: EDAState) -> dict:
+    """LangGraph Node 3: Generates Python analysis and plotting code."""
+    q = state["question"]
+    target = state["target"]
+    summary = state["summary"]
+
     if state.get("error"):
-        prompt += (
-            f"\n\nYour previous code failed with this error:\n```\n{state['error']}\n```\n"
-            f"Previous code was:\n```python\n{state['code']}\n```\nFix the code."
+        prompt = (
+            f"Sub-question: {q}\n"
+            f"Previous code that failed:\n```python\n{state['code']}\n```\n"
+            f"Error message:\n{state['error']}\n"
+            "Fix the Python code. Return ONLY executable Python code."
         )
-    elif state.get("critique"):
-        prompt += (
-            f"\n\nReviewer feedback on previous output:\n{state['critique']}\n"
-            f"Previous output was:\n{state['output']}\n"
-            "Update the code to resolve the feedback."
+    else:
+        prompt = (
+            f"Sub-Question to investigate: {q}\n\n"
+            f"Primary Target: {target}\n"
+            f"Dataset Summary:\n{summary[:1000]}\n\n"
+            "Write concise Python code to analyze the data, print numerical results with group sizes (n = ...), and save a relevant chart to CHART_PATH."
         )
 
-    code = strip_fences(ask(CODER_SYSTEM, prompt))
-    return {"code": code, "critique": ""}
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(_call_coder_llm, prompt)
+        res = fut.result(timeout=30.0)
+        code = strip_fences(res)
+    except Exception:
+        # Robust question-aware fallback code using domain column matching
+        eval_col = _find_best_column(list(state["df"].columns), q, target)
+        code = (
+            f"counts = df.groupby('{eval_col}')['{target}'].count()\n"
+            f"rates = df.groupby('{eval_col}')['{target}'].value_counts(normalize=True).unstack()\n"
+            "for idx_val in rates.index:\n"
+            "    n_val = counts.get(idx_val, 0)\n"
+            "    row_rates = {k: f'{v:.1%}' for k, v in rates.loc[idx_val].items()}\n"
+            "    print(f'Group [{idx_val}] (n = {n_val}): {row_rates}')\n"
+            "plt.figure(figsize=(7, 4))\n"
+            f"sns.countplot(data=df, x='{eval_col}', hue='{target}')\n"
+            f"plt.title({repr(q[:45])})\n"
+            "plt.savefig(CHART_PATH, bbox_inches='tight')\n"
+        )
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    new_retries = state.get("retries", 0) + (1 if state.get("error") else 0)
+    return {"code": code, "retries": new_retries}
 
 
-# ---------- Node 4: Executor ----------
-def executor(state: EDAState) -> dict:
+def executor_node(state: EDAState) -> dict:
+    """LangGraph Node 4: Executes Python analysis script in RAM."""
     step_num = state["current_idx"] + 1
     chart_path = os.path.join(OUT_DIR, f"step_{step_num}.png")
+    output, err = execute_step_in_memory(state["code"], state["df"], chart_path)
 
-    preamble = (
-        "import pandas as pd, numpy as np, matplotlib\n"
-        "matplotlib.use('Agg')\n"
-        "import matplotlib.pyplot as plt, seaborn as sns\n"
-        f"df = pd.read_csv({state['data_path']!r})\n"
-        f"CHART_PATH = {chart_path!r}\n"
-    )
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
-        f.write(preamble + state["code"])
-        script_file = f.name
-
-    try:
-        r = subprocess.run(
-            [sys.executable, script_file],
-            capture_output=True,
-            text=True,
-            timeout=EXEC_TIMEOUT,
-            encoding="utf-8",
-            errors="replace",
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+    # If retry also failed, execute safe fallback so step has empirical output
+    if err and state.get("retries", 0) >= 1:
+        q = state["question"]
+        target = state["target"]
+        df = state["df"]
+        eval_col = _find_best_column(list(df.columns), q, target)
+        fallback_code = (
+            f"counts = df.groupby('{eval_col}')['{target}'].count()\n"
+            f"rates = df.groupby('{eval_col}')['{target}'].value_counts(normalize=True).unstack()\n"
+            "for idx_val in rates.index:\n"
+            "    n_val = counts.get(idx_val, 0)\n"
+            "    row_rates = {k: f'{v:.1%}' for k, v in rates.loc[idx_val].items()}\n"
+            "    print(f'Group [{idx_val}] (n = {n_val}): {row_rates}')\n"
+            "plt.figure(figsize=(7, 4))\n"
+            f"sns.countplot(data=df, x='{eval_col}', hue='{target}')\n"
+            f"plt.title({repr(q[:45])})\n"
+            "plt.savefig(CHART_PATH, bbox_inches='tight')\n"
         )
-    except subprocess.TimeoutExpired:
-        return {"error": f"Execution timed out after {EXEC_TIMEOUT}s", "retries": state["retries"] + 1}
-    finally:
-        if os.path.exists(script_file):
-            try:
-                os.remove(script_file)
-            except Exception:
-                pass
+        fb_out, fb_err = execute_step_in_memory(fallback_code, df, chart_path)
+        if not fb_err:
+            output, err = fb_out, None
 
-    if r.returncode != 0:
-        return {"error": r.stderr[-1500:], "retries": state["retries"] + 1}
-
-    out = r.stdout[:5000].strip()
-    return {"output": out, "error": None}
-
-
-# ---------- Node 5: Critic ----------
-CRITIC_SYSTEM = f"""You are a strict statistical reviewer of an exploratory data analysis.
-You are given a sub-question, the code, and the printed output.
-Evaluate whether the output provides reliable empirical evidence to answer the sub-question.
-
-Rules:
-1. Exact rates/means and sample sizes (n >= {MIN_GROUP_SIZE}) must be present.
-2. If output has valid rates and group sizes, set verdict = 'accept'.
-3. Extract 1 or 2 concrete findings. Each finding statement must be ONE concise sentence naming the groups,
-   their rates/means, sample sizes as 'n = 123', and key takeaway.
-4. If output failed or is completely empty, use 'revise' (or 'reject' if revisions exhausted).
-"""
-
-
-def critic(state: EDAState) -> dict:
-    user_msg = (
-        f"Sub-Question: {state['question']}\n\n"
-        f"Printed Output:\n{state['output']}\n\n"
-        f"Revisions remaining: {max(0, MAX_REVISIONS - state.get('revisions', 0))}"
-    )
-
-    try:
-        review = critic_llm.invoke([
-            ("system", CRITIC_SYSTEM),
-            ("user", user_msg)
-        ])
-    except Exception as e:
-        review = None
-
-    if review is None:
-        return {
-            "verdict": "accept",
-            "critique": "Critic review fallback",
-            "pending_findings": [{
-                "statement": sanitize_text(state["output"][:250].replace("\n", " ")),
-                "strength": 3,
-                "adjusted_for": [],
-                "variable": ""
-            }]
-        }
-
-    verdict = review.verdict
-    can_revise = state["revisions"] < MAX_REVISIONS
-
-    pending = []
-    for f in review.findings:
-        stmt = sanitize_text(f.statement)
-        pending.append({
-            "statement": stmt,
-            "strength": max(1, min(5, int(f.strength))),
-            "adjusted_for": f.adjusted_for,
-            "variable": f.variable
-        })
-
-    if verdict == "revise" and not can_revise:
-        verdict = "accept" if pending else "reject"
-
-    update = {
-        "verdict": verdict,
-        "critique": review.reason,
-        "pending_findings": pending if verdict == "accept" else []
+    return {
+        "output": output,
+        "error": err,
     }
-    if verdict == "revise":
-        update["revisions"] = state["revisions"] + 1
-        update["retries"] = 0
-
-    return update
 
 
-# ---------- Node 6: Recorder ----------
-def recorder(state: EDAState) -> dict:
+def recorder_node(state: EDAState) -> dict:
+    """LangGraph Node 5: Records empirical findings, chart paths, and advances index."""
     idx = state["current_idx"]
     step_num = idx + 1
     chart_path = os.path.join(OUT_DIR, f"step_{step_num}.png")
-    chart_saved = [chart_path] if os.path.exists(chart_path) else []
+    actual_chart = chart_path if os.path.exists(chart_path) else ""
 
-    if state.get("error"):
-        return {
-            "failed": [f"{state['question']} (Failed: {state['error'][:100]})"],
-            "current_idx": idx + 1,
-            "error": None
-        }
+    first_finding_line = ""
+    if state.get("output"):
+        for line in state["output"].splitlines():
+            line_str = line.strip()
+            if line_str.startswith("Group ") or (any(k in line_str.lower() for k in ["%", "rate", "diff"]) and not line_str.lower().startswith("sample size:")):
+                first_finding_line = line_str
+                break
+        if not first_finding_line:
+            first_finding_line = state["output"].splitlines()[0].strip()
 
-    if state["verdict"] == "accept":
-        recorded_findings = [
-            {
-                "question": state["question"],
-                "finding": p["statement"],
-                "strength": p["strength"],
-                "adjusted_for": p.get("adjusted_for", []),
-                "variable": p.get("variable", ""),
-                "chart": chart_path if os.path.exists(chart_path) else ""
-            }
-            for p in state["pending_findings"]
-        ]
-        return {
-            "findings": recorded_findings,
-            "step_charts": chart_saved,
-            "current_idx": idx + 1
-        }
+    new_finding = {
+        "step": step_num,
+        "question": state["question"],
+        "finding": first_finding_line or "Observed empirical distribution across groups.",
+        "output": state.get("output", ""),
+        "chart": actual_chart
+    }
+
+    new_charts = list(state.get("step_charts", []))
+    if actual_chart and actual_chart not in new_charts:
+        new_charts.append(actual_chart)
 
     return {
-        "rejected": [f"{state['question']} ({state['critique']})"],
-        "current_idx": idx + 1
+        "findings": state.get("findings", []) + [new_finding],
+        "step_charts": new_charts,
+        "current_idx": idx + 1,
     }
 
 
-# ---------- Node 7: Reporter (Direct-Answer Synthesis) ----------
-REPORTER_SYSTEM = """You are a Principal Data Analyst delivering a concise, structured analytical briefing in Markdown.
-Your goal is to synthesize the empirical findings from the investigation steps into an executive summary.
-
-FORMATTING & TYPOGRAPHY RULES:
-- Do NOT repeat the user's question or prompt as a title or heading. The user's question is already visible.
-- Do NOT use massive `#` or `##` headings. Use ONLY `###` level headings for compact, clean, readable typography.
-- Use EXACTLY these four section headings:
-   ### Executive Summary
-   A 2-3 sentence direct answer synthesizing the primary takeaway with key rates and numbers.
-
-   ### Key Findings & Empirical Evidence
-   Structured bullet points presenting the evidence from each investigated sub-question.
-   For each bullet, cite exact rates, group sizes (n = ...), and takeaways.
-   Reference corresponding step charts where relevant (e.g. `[Step 1 Chart]`).
-
-   ### Confounders & Key Nuances
-   Explain what happened when controlling for other variables (what held vs what was explained by covariates).
-
-   ### Recommended Next Steps
-   3 concise, actionable follow-up steps for deeper modeling or decision-making.
-
-- Strictly NO unsupported claims or causal language; report observational relationships and exact findings.
-"""
-
-
-def reporter(state: EDAState) -> dict:
-    bullets = []
-    for f in state["findings"]:
-        adj = f" (controlled for: {', '.join(f['adjusted_for'])})" if f.get("adjusted_for") else ""
-        chart_tag = f" [Refer to {os.path.basename(f['chart'])}]" if f.get("chart") else ""
-        bullets.append(f"- Sub-Q: *{f['question']}*\n  Finding: {f['finding']}{adj}{chart_tag}")
-
-    findings_text = "\n".join(bullets) if bullets else "No conclusive findings were verified."
+def reporter_node(state: EDAState) -> dict:
+    """LangGraph Node 6: Synthesizes direct-answer executive briefing."""
+    evidence_blocks = []
+    for r in state.get("findings", []):
+        chart_tag = f"Chart: {os.path.basename(r['chart'])}\n" if r.get("chart") else ""
+        evidence_blocks.append(
+            f"Step {r['step']} Investigation: *{r['question']}*\n"
+            f"{chart_tag}"
+            f"Empirical Output:\n{r.get('output', r.get('finding', ''))}\n"
+        )
+    all_evidence = "\n---\n".join(evidence_blocks)
 
     user_prompt = (
         f"USER INQUIRY / GOAL: {state['goal']}\n"
-        f"TARGET COLUMN: {state['outcome']}\n\n"
-        f"EMPIRICAL FINDINGS FROM INVESTIGATION:\n{findings_text}\n\n"
-        f"FAILED OR REJECTED QUESTIONS:\n{', '.join(state['failed'] + state['rejected']) or 'None'}\n\n"
-        "Synthesize these findings into the structured briefing using the required ### sections."
+        f"TARGET COLUMN: {state['target']}\n\n"
+        f"EMPIRICAL RESULTS FROM INVESTIGATION STEPS:\n{all_evidence}\n\n"
+        "Directly answer the user's specific inquiry using these empirical findings. "
+        "State the bottom-line answer up front and structure the briefing logically using clean, content-specific ### headings."
     )
 
-    report_content = ask(REPORTER_SYSTEM, user_prompt)
-    report_content = sanitize_text(report_content)
-    # Normalize all headings to compact H3 level
-    report_content = re.sub(r"^#{1,2}\s+", "### ", report_content, flags=re.MULTILINE)
-    # Strip any redundant question repetition header
-    report_content = re.sub(r"^###\s+Direct Answer:.*?\n+", "### Executive Summary\n", report_content, flags=re.IGNORECASE)
+    def _call_reporter(m):
+        return m.invoke([
+            ("system", REPORTER_SYSTEM),
+            ("user", user_prompt)
+        ]).content
 
-    path = os.path.join(OUT_DIR, "report.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(report_content)
+    report = ""
+    last_reporter_err = None
+    for model in [fast_llm, reasoning_llm]:
+        ex = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = ex.submit(_call_reporter, model)
+            content = fut.result(timeout=35.0)
+            if isinstance(content, list):
+                content = "".join(b if isinstance(b, str) else b.get("text", "") for b in content)
+            if content and len(content.strip()) > 100:
+                report = content
+                break
+        except Exception as e:
+            last_reporter_err = str(e)
+            continue
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
-    return {}
+    if not report:
+        err_detail = f" (`{last_reporter_err}`)" if last_reporter_err else ""
+        report = (
+            f"### Investigation Findings: {state['goal']}\n\n"
+            f"> ⚠️ **Notice**: The final executive briefing could not be generated by the AI model{err_detail}. "
+            f"Below are the empirical findings and step charts computed directly from the dataset.\n\n"
+            f"### Empirical Evidence from Investigation Steps\n\n{all_evidence}\n\n"
+            f"### Recommended Actions\n"
+            f"- Review the step charts below to inspect the empirical distributions directly\n"
+            f"- Verify your OpenRouter API key quota or model status if this notice persists"
+        )
+
+    report = sanitize_text(report)
+    report = re.sub(r"^#{1,2}\s+", "### ", report, flags=re.MULTILINE)
+
+    report_file = os.path.join(OUT_DIR, "report.md")
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write(report)
+
+    return {"report": report}
 
 
-# ---------- Routing Logic ----------
-def route_after_exec(state: EDAState) -> str:
-    if state.get("error"):
-        return "coder" if state["retries"] < MAX_RETRIES else "recorder"
-    return "critic"
+# ---------- Conditional Routing Functions ----------
+def route_after_executor(state: EDAState) -> str:
+    """If execution failed and retries remain, retry code generation; else record."""
+    if state.get("error") and state.get("retries", 0) < 1:
+        return "coder"
+    return "recorder"
 
 
-def route_after_critic(state: EDAState) -> str:
-    return "coder" if state["verdict"] == "revise" else "recorder"
-
-
-def route_after_record(state: EDAState) -> str:
-    idx = state.get("current_idx", 0)
-    agenda = state.get("agenda", [])
-    if idx < len(agenda):
+def route_after_recorder(state: EDAState) -> str:
+    """If more sub-questions remain in the agenda, continue to planner; else synthesize."""
+    if state["current_idx"] < len(state.get("agenda", [])):
         return "planner"
     return "reporter"
 
 
-# ---------- Build Graph ----------
-def build_graph():
-    g = StateGraph(EDAState)
-    g.add_node("profiler", profiler)
-    g.add_node("planner", planner)
-    g.add_node("coder", coder)
-    g.add_node("executor", executor)
-    g.add_node("critic", critic)
-    g.add_node("recorder", recorder)
-    g.add_node("reporter", reporter)
+# ---------- Graph Construction ----------
+def build_eda_graph():
+    """Builds the stateful LangGraph Multi-Agent EDA Graph."""
+    workflow = StateGraph(EDAState)
+    workflow.add_node("profiler", profiler_node)
+    workflow.add_node("planner", planner_node)
+    workflow.add_node("coder", coder_node)
+    workflow.add_node("executor", executor_node)
+    workflow.add_node("recorder", recorder_node)
+    workflow.add_node("reporter", reporter_node)
 
-    g.add_edge(START, "profiler")
-    g.add_edge("profiler", "planner")
-    g.add_edge("planner", "coder")
-    g.add_edge("coder", "executor")
+    workflow.add_edge(START, "profiler")
+    workflow.add_edge("profiler", "planner")
+    workflow.add_edge("planner", "coder")
+    workflow.add_edge("coder", "executor")
 
-    g.add_conditional_edges("executor", route_after_exec, ["coder", "critic", "recorder"])
-    g.add_conditional_edges("critic", route_after_critic, ["coder", "recorder"])
-    g.add_conditional_edges("recorder", route_after_record, ["planner", "reporter"])
-    g.add_edge("reporter", END)
+    workflow.add_conditional_edges(
+        "executor",
+        route_after_executor,
+        {"coder": "coder", "recorder": "recorder"}
+    )
+    workflow.add_conditional_edges(
+        "recorder",
+        route_after_recorder,
+        {"planner": "planner", "reporter": "reporter"}
+    )
+    workflow.add_edge("reporter", END)
 
-    return g.compile()
+    return workflow.compile()
 
 
-# ---------- Generator for Streamlit Stream ----------
-def run_autonomous_eda_stream(df: pd.DataFrame, goal: str = "Explore key patterns and drivers", target: Optional[str] = None, max_steps: int = 4):
-    """Generator running the Question-Directed LangGraph workflow and yielding live events and progress."""
+# ---------- Public Streaming Generator for Streamlit ----------
+def run_autonomous_eda_stream(
+    df: pd.DataFrame,
+    goal: str = "Explore key patterns and drivers",
+    target: Optional[str] = None,
+    max_steps: int = 4
+):
+    """
+    Generator yielding live execution events from the LangGraph workflow to Streamlit.
+    """
     os.makedirs(OUT_DIR, exist_ok=True)
-    temp_path = os.path.join(OUT_DIR, "current_dataset.csv")
-    df.to_csv(temp_path, index=False)
 
+    # Determine target column
     if not target or target not in df.columns:
         candidates = ["survived", "churn", "target", "label", "outcome", "y", "fraud"]
         found = next((c for c in df.columns if c.lower() in candidates), None)
         target = found if found else str(df.columns[-1])
 
-    app = build_graph()
-    initial: EDAState = {
-        "data_path": temp_path,
+    # Build dataset summary
+    lines = [f"Shape: {df.shape[0]:,} rows x {df.shape[1]} columns", f"Target Column: {target}", "Columns:"]
+    for c in df.columns:
+        lines.append(f"- {c}: dtype={df[c].dtype}, missing={df[c].isna().mean():.1%}, unique={df[c].nunique()}")
+    summary_str = "\n".join(lines)
+
+    app = build_eda_graph()
+    initial_state: EDAState = {
         "goal": goal,
-        "summary": "",
-        "columns": [],
-        "numeric_columns": [],
-        "id_like_columns": [],
-        "outcome": target,
+        "target": target,
+        "summary": summary_str,
+        "df": df,
+        "max_steps": max_steps,
         "agenda": [],
         "current_idx": 0,
         "question": "",
@@ -560,56 +567,101 @@ def run_autonomous_eda_stream(df: pd.DataFrame, goal: str = "Explore key pattern
         "output": "",
         "error": None,
         "retries": 0,
-        "revisions": 0,
-        "verdict": "",
-        "critique": "",
-        "pending_findings": [],
-        "findings": [],
         "step_charts": [],
-        "failed": [],
-        "rejected": [],
+        "findings": [],
+        "report": "",
     }
 
-    accumulated_findings = []
-    total_steps = max_steps
+    yield {
+        "node": "profiler",
+        "preview": "Formulating hypothesis agenda via LangGraph Profiler…",
+        "progress": 0.08
+    }
 
-    for update in app.stream(initial, config={"recursion_limit": 100}, stream_mode="updates"):
+    total_steps = max_steps
+    accumulated_findings = []
+    accumulated_charts = []
+    final_report = ""
+
+    for update in app.stream(initial_state, config={"recursion_limit": 50}, stream_mode="updates"):
         for node, delta in update.items():
             delta = delta or {}
-            idx = delta.get("current_idx", 0)
+
             if delta.get("agenda"):
                 total_steps = len(delta["agenda"])
+                yield {
+                    "node": "profiler",
+                    "agenda": delta["agenda"],
+                    "preview": f"{total_steps} sub-questions formulated",
+                    "progress": 0.20
+                }
 
-            step_chart = os.path.join(OUT_DIR, f"step_{idx}.png")
-            chart_file = step_chart if os.path.exists(step_chart) else None
+            elif node == "planner":
+                idx = delta.get("current_idx", 0)
+                q = delta.get("question", "")
+                progress_val = 0.20 + (0.55 * (idx / max(1, total_steps)))
+                yield {
+                    "node": "planner",
+                    "step": idx,
+                    "total_steps": total_steps,
+                    "question": q,
+                    "preview": f"Investigating: {q}",
+                    "progress": progress_val
+                }
 
-            if delta.get("findings"):
-                accumulated_findings.extend(delta["findings"])
+            elif node == "coder":
+                yield {
+                    "node": "coder",
+                    "preview": "Generating Python analysis & visualization script…",
+                    "progress": None
+                }
 
-            prog = min(1.0, max(0.0, idx / max(1, total_steps)))
+            elif node == "executor":
+                out = delta.get("output", "")
+                err = delta.get("error")
+                preview_text = out[:120].replace("\n", " ") if out else (err or "Code executed")
+                yield {
+                    "node": "executor",
+                    "preview": preview_text,
+                    "progress": None
+                }
 
-            yield {
-                "node": node,
-                "delta": delta,
-                "agenda": delta.get("agenda"),
-                "question": delta.get("question"),
-                "step": idx,
-                "total_steps": total_steps,
-                "progress": prog,
-                "chart_path": chart_file,
-                "preview": delta.get("critique") or delta.get("question") or ""
-            }
+            elif node == "recorder":
+                idx = delta.get("current_idx", 0)
+                if delta.get("findings"):
+                    accumulated_findings = delta["findings"]
+                if delta.get("step_charts"):
+                    accumulated_charts = delta["step_charts"]
 
-    report_path = os.path.join(OUT_DIR, "report.md")
-    report_content = ""
-    if os.path.exists(report_path):
-        with open(report_path, "r", encoding="utf-8") as f:
-            report_content = f.read()
+                step_chart = os.path.join(OUT_DIR, f"step_{idx}.png")
+                chart_file = step_chart if os.path.exists(step_chart) else None
 
+                progress_val = 0.20 + (0.60 * (idx / max(1, total_steps)))
+                yield {
+                    "node": "recorder",
+                    "step": idx - 1,
+                    "total_steps": total_steps,
+                    "chart_path": chart_file,
+                    "preview": f"Recorded findings for step {idx}/{total_steps}",
+                    "progress": progress_val
+                }
+
+            elif node == "reporter":
+                final_report = delta.get("report", "")
+                yield {
+                    "node": "reporter",
+                    "report": final_report,
+                    "preview": "Synthesized executive briefing",
+                    "progress": 0.95
+                }
+
+    # Final completion event
     yield {
         "node": "complete",
-        "report": report_content,
+        "report": final_report,
         "target": target,
         "insights": accumulated_findings,
-        "preview": "Investigation complete!"
+        "step_charts": accumulated_charts,
+        "preview": "LangGraph Autonomous EDA complete!",
+        "progress": 1.0
     }
