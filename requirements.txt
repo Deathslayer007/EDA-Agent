@@ -1,0 +1,12 @@
+langgraph
+langchain
+langchain-google-genai
+langchain-openrouter
+pandas
+numpy
+scipy
+statsmodels
+matplotlib
+seaborn
+python-dotenv
+streamlit
