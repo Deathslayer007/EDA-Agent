@@ -76,48 +76,61 @@ No query falls through the cracks — ambiguous inputs trigger a **Clarification
 
 ## 🏗️ System Architecture
 
-```
-                                  User Prompt & Dataset
-                                            │
-                                            ▼
-               ┌─────────────────────────────────────────────────────────┐
-               │    AI Intent Router (Nemotron 3.5 Lightning: ~500ms)    │
-               └────────────────────────────┬────────────────────────────┘
-                                            │
-                 ┌──────────────────────────┼──────────────────────────┐
-                 │                          │                          │
-                 ▼                          ▼                          ▼
-           [⚡ Quick Query]           [🧠 Autonomous EDA]        [🤖 Modelling Advisor]
-         (Nemotron 3.5 Lightning)  (Nemotron 3 Ultra 550B)    (Nemotron 3 Ultra 550B)
-                 │                          │                          │
-          Single Python Code         Decomposes into 3-4        Reads Data Profile +
-          & Instant Chart (<2s)      Sub-Hypotheses (Agenda)    Cached EDA Insights
-                                            │                          │
-                                    ┌───────┴───────┐            Generates 6-Part ML
-                                    │  Per Sub-Q:   │            Strategy Report
-                                    │  Plan → Code  │            (Zero Code / No Rerun)
-                                    │  → Execute    │
-                                    │  → Critic     │
-                                    │  → Record     │
-                                    └───────┬───────┘
-                                            │
-                                    Synthesizes Direct-Answer
-                                    Report & Caches Insights
-                                            │
-                                            ▼
-                               st.session_state["eda_insights"]
+```mermaid
+flowchart TD
+    User["👤 User Prompt & Uploaded Dataset"] --> Router{"🎯 AI Intent Router<br/><i>nemotron-3.5-lightning (~500ms)</i>"}
+
+    Router -->|"Specific chart, metric, table lookup"| QQ["⚡ Quick Query Path<br/><i>nemotron-3.5-lightning</i>"]
+    Router -->|"Investigative, causal, exploratory"| EDA["🧠 Autonomous EDA Path<br/><i>nemotron-3-ultra-550b</i>"]
+    Router -->|"ML strategy, metrics, algorithms"| ML["🤖 Modelling Advisor Path<br/><i>nemotron-3-ultra-550b</i>"]
+    Router -->|"Vague, ambiguous query"| Clarify["💬 Clarification Needed<br/><i>Prompt user for details</i>"]
+
+    Clarify -.-> User
+
+    subgraph FastPath ["⚡ Fast Path (~1–2s)"]
+        QQ --> QQ_Code["Single-shot Python Generation"]
+        QQ_Code --> QQ_Exec["In-Memory Execution (pandas / seaborn)"]
+        QQ_Exec --> QQ_Out["📊 Instant Chart & Interactive Table"]
+    end
+
+    subgraph DeepPath ["🧠 Deep Path (~30–90s)"]
+        EDA --> EDA_Agenda["Decompose into 3–4 Step Agenda<br/><i>Baseline ➔ Confounders ➔ Subgroups ➔ Attribution</i>"]
+        EDA_Agenda --> EDA_Loop["LangGraph Multi-Agent Iteration<br/><i>Coder ➔ Executor ➔ Critic (n ≥ 20)</i>"]
+        EDA_Loop --> EDA_Out["📝 Executive Briefing & Step Charts"]
+    end
+
+    subgraph PrescriptivePath ["🤖 Prescriptive Path (~10–20s)"]
+        ML --> ML_Profile["Read Deterministic Profile (< 50ms)"]
+        ML_Profile --> ML_Report["📋 6-Part ML Strategy Roadmap<br/><i>Algorithms, Splitting, Features, Metrics</i>"]
+    end
+
+    EDA_Out ==>|"Cache Verified Findings"| Cache[("💾 Session Memory Cache<br/>st.session_state['eda_insights']")]
+    Cache -.->|"Inject Prior EDA Context"| ML_Profile
 ```
 
 ### LangGraph EDA Agent Flow
 
 The Autonomous EDA engine is built as a **stateful multi-agent graph** using LangGraph:
 
-```
-START → Profiler → Planner → Coder → Executor ─┬─→ Critic ─┬─→ Recorder ─┬─→ Planner (next sub-Q)
-                                                │           │             │
-                                          (on error,       (on "revise") └─→ Reporter → END
-                                           retry ≤ 2)       back to Coder
-                                           back to Coder
+```mermaid
+flowchart TD
+    Start([● START]) --> Profiler["📋 Profiler<br/>• Ingest dataset summary<br/>• Decompose query into 3–4 sub-questions"]
+    Profiler --> Planner["🎯 Planner<br/>Schedule next sub-question from agenda"]
+    
+    Planner --> Coder["💻 Coder Agent<br/>Generate Python analysis & chart script"]
+    Coder --> Executor["⚙️ Executor<br/>Subprocess execution (60s timeout)"]
+
+    Executor -->|"Error (retries < 2)"| Coder
+    Executor -->|"Execution Success"| Critic{"🧐 Critic Review<br/>• Sample size n ≥ 20?<br/>• Rates & metrics present?"}
+    Executor -->|"Retries Exhausted"| Recorder
+
+    Critic -->|"Verdict: Revise<br/>(code update needed)"| Coder
+    Critic -->|"Verdict: Accept / Reject"| Recorder["💾 Recorder<br/>• Save empirical findings<br/>• Persist step chart (step_i.png)"]
+
+    Recorder -->|"More sub-questions in agenda"| Planner
+    Recorder -->|"All sub-questions completed"| Reporter["📝 Reporter Agent<br/>Synthesize structured 4-part Executive Briefing"]
+
+    Reporter --> EndNode([🏁 END])
 ```
 
 | Node | Role |
