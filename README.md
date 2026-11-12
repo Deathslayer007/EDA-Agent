@@ -54,9 +54,9 @@ flowchart LR
 ```mermaid
 flowchart LR
     Code["💻 Python Code Gen"] --> Exec["⚙️ RAM Sandbox Execution"]
-    Exec --> Chart["📈 Interactive Chart / Table"]
-    Exec --> Sum["💡 AI Summarizer Node\n(1–2 sentence takeaway)"]
-    Chart --> UI["📊 Streamlit UI"]
+    Exec --> Output["📈 Generated Chart & Data<br/><i>(figures, metrics, tables)</i>"]
+    Output --> UI["📊 Streamlit UI<br/><i>(displays visual chart)</i>"]
+    Output --> Sum["💡 AI Summarizer Node<br/><i>(interprets the findings)</i>"]
     Sum --> UI
 ```
 
