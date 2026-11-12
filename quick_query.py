@@ -2,6 +2,7 @@
 Quick Query Engine (Fast Path).
 Executes single-shot analytical and visualization queries in ~1-2 seconds
 with security sandboxing (restricted builtins and execution timeout).
+Includes an AI summarizer that describes chart insights in plain language.
 """
 import concurrent.futures
 import contextlib
@@ -9,6 +10,7 @@ import io
 import os
 import re
 import sys
+import warnings
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -17,6 +19,9 @@ import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 from langchain_openrouter import ChatOpenRouter
+
+# Suppress pandas FutureWarnings (observed=False deprecation, etc.)
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
 
 load_dotenv(override=True)
 if os.getenv("OPENROUTER") and not os.getenv("OPENROUTER_API_KEY"):
@@ -210,3 +215,93 @@ def run_quick_query(query: str, df: pd.DataFrame, schema_summary: str, chat_hist
             pass
 
     return result
+
+
+
+# ---------- AI Chart / Output Summarizer ----------
+
+SUMMARIZER_SYSTEM = """Given the user's question and the analysis output, write a 1–2 sentence answer.
+
+Rules:
+- Directly answer the question with the key numbers from the output. Bold the most important number.
+- If a chart was produced, mention the main visual takeaway in half a sentence.
+- Do NOT explain methodology, code, or analysis steps. Just state the finding.
+"""
+
+
+def _build_summary_prompt(query: str, result: dict) -> str:
+    """Builds the prompt for the summarizer from query + execution result."""
+    output_text = result.get("text", "")
+    has_figure = result.get("figure") is not None
+    has_table = result.get("table") is not None
+    code = result.get("code", "")
+
+    context_parts = [f"User Question: {query}"]
+
+    if output_text:
+        context_parts.append(f"Analysis Output:\n{output_text[:1500]}")
+
+    if has_table:
+        table_preview = result["table"].head(10).to_string()
+        context_parts.append(f"Table Result (first 10 rows):\n{table_preview[:800]}")
+
+    if has_figure:
+        context_parts.append(f"A chart was generated. Chart code:\n{code[:600]}")
+    else:
+        context_parts.append("No chart was generated (text/table-only response).")
+
+    return "\n\n".join(context_parts) + "\n\nWrite a concise insight summary."
+
+
+def summarize_quick_result(query: str, result: dict) -> str:
+    """Generates a plain-language AI summary of the quick query output and chart."""
+    if result.get("error"):
+        return ""
+
+    output_text = result.get("text", "")
+    has_figure = result.get("figure") is not None
+    has_table = result.get("table") is not None
+
+    if not output_text and not has_figure and not has_table:
+        return ""
+
+    prompt = _build_summary_prompt(query, result)
+
+    try:
+        res = llm.invoke([
+            ("system", SUMMARIZER_SYSTEM),
+            ("user", prompt)
+        ]).content
+        if isinstance(res, list):
+            res = "".join(b if isinstance(b, str) else b.get("text", "") for b in res)
+        return res.strip() if res else ""
+    except Exception:
+        return ""
+
+
+def stream_summary(query: str, result: dict):
+    """Streams the AI summary token-by-token for Streamlit's st.write_stream."""
+    if result.get("error"):
+        return
+
+    output_text = result.get("text", "")
+    has_figure = result.get("figure") is not None
+    has_table = result.get("table") is not None
+
+    if not output_text and not has_figure and not has_table:
+        return
+
+    prompt = _build_summary_prompt(query, result)
+
+    try:
+        for chunk in llm.stream([
+            ("system", SUMMARIZER_SYSTEM),
+            ("user", prompt)
+        ]):
+            text = chunk.content if hasattr(chunk, "content") else str(chunk)
+            if isinstance(text, list):
+                text = "".join(b if isinstance(b, str) else b.get("text", "") for b in text)
+            if text:
+                yield text
+    except Exception:
+        return

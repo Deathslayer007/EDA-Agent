@@ -28,6 +28,7 @@ load_dotenv(override=True)
 if os.getenv("OPENROUTER") and not os.getenv("OPENROUTER_API_KEY"):
     os.environ["OPENROUTER_API_KEY"] = os.getenv("OPENROUTER")
 warnings.filterwarnings("ignore", message=".*fixed sampling defaults.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ---------- Models & Config ----------
 FAST_MODEL = os.getenv("FAST_MODEL", "nvidia/nemotron-3.5-lightning:free")

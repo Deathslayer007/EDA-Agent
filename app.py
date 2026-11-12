@@ -10,14 +10,18 @@ Automatically routes queries through the AI Intent Router to:
 import io
 import os
 import time
+import warnings
 import zipfile
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
+# Suppress pandas FutureWarnings globally (observed=False deprecation, etc.)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 from router import route_query
-from quick_query import run_quick_query
+from quick_query import run_quick_query, stream_summary
 from profiler import run_autonomous_eda_stream, OUT_DIR
 from modelling_advisor import run_modelling_advice, stream_modelling_advice
 
@@ -378,12 +382,24 @@ else:
         with st.chat_message(msg["role"], avatar=avatar):
             if msg.get("badge"):
                 st.markdown(msg["badge"], unsafe_allow_html=True)
-            if msg.get("text"):
-                st.markdown(format_display_text(msg["text"]))
-            if msg.get("table") is not None:
-                st.dataframe(msg["table"], use_container_width=True)
-            if msg.get("figure") is not None:
+            # For quick_query with summarizer: show chart first, then summary
+            if msg.get("intent") == "quick_query" and msg.get("figure") is not None:
                 st.pyplot(msg["figure"])
+                if msg.get("table") is not None:
+                    st.dataframe(msg["table"], use_container_width=True)
+                if msg.get("raw_output"):
+                    with st.expander("📋 Raw Output", expanded=False):
+                        st.markdown(format_display_text(msg["raw_output"]))
+                if msg.get("text"):
+                    st.markdown("**💡 AI Insight:**")
+                    st.markdown(format_display_text(msg["text"]))
+            else:
+                if msg.get("figure") is not None:
+                    st.pyplot(msg["figure"])
+                if msg.get("table") is not None:
+                    st.dataframe(msg["table"], use_container_width=True)
+                if msg.get("text"):
+                    st.markdown(format_display_text(msg["text"]))
             if msg.get("code"):
                 with st.expander("🔍 View Python Code"):
                     st.code(msg["code"], language="python")
@@ -447,17 +463,29 @@ else:
                 tbl = res.get("table")
                 fig = res.get("figure")
                 code = res.get("code")
+                summary_text = ""
 
                 if res.get("error"):
                     st.error(res["error"])
                     ans = f"Error: {res['error']}"
                 else:
-                    if ans:
-                        st.write_stream(stream_text(ans))
-                    if tbl is not None:
-                        st.dataframe(tbl, use_container_width=True)
+                    # Show chart and data output first
                     if fig is not None:
                         st.pyplot(fig)
+                    if tbl is not None:
+                        st.dataframe(tbl, use_container_width=True)
+                    if ans:
+                        with st.expander("📋 Raw Output", expanded=False):
+                            st.markdown(format_display_text(ans))
+
+                    # Stream AI insight summary
+                    has_content = ans or tbl is not None or fig is not None
+                    if has_content:
+                        st.markdown("**💡 AI Insight:**")
+                        summary_text = st.write_stream(stream_summary(user_prompt, res))
+                        if not summary_text:
+                            summary_text = ans  # fallback to raw output
+
                     if code:
                         with st.expander("🔍 View Python Code"):
                             st.code(code, language="python")
@@ -465,10 +493,11 @@ else:
                 st.session_state["messages"].append({
                     "role": "assistant",
                     "badge": badge,
-                    "text": ans,
+                    "text": summary_text or ans,
                     "table": tbl,
                     "figure": fig,
                     "code": code,
+                    "raw_output": ans,
                     "intent": "quick_query"
                 })
 
